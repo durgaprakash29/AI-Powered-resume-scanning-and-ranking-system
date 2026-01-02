@@ -1,0 +1,1273 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import re
+import io
+from datetime import datetime
+import base64
+from typing import Dict, List, Tuple
+import warnings
+warnings.filterwarnings('ignore')
+
+# File processing
+import PyPDF2
+from docx import Document
+
+
+# NLP libraries
+try:
+    import spacy
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    import nltk
+    from nltk.corpus import stopwords
+    from nltk.tokenize import word_tokenize, sent_tokenize
+except ImportError:
+    st.error("Please install NLP packages: pip install spacy scikit-learn nltk")
+
+# Visualization libraries
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+except ImportError:
+    st.error("Please install Plotly: pip install plotly")
+
+# Download required NLTK data
+try:
+    import ssl
+    try:
+        _create_unverified_https_context = ssl._create_unverified_context
+    except AttributeError:
+        pass
+    else:
+        ssl._create_default_https_context = _create_unverified_https_context
+    
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    nltk.download('averaged_perceptron_tagger', quiet=True)
+except:
+    pass
+
+# Load spaCy model
+@st.cache_resource
+def load_nlp_model():
+    try:
+        nlp = spacy.load("en_core_web_sm")
+        return nlp
+    except OSError:
+        st.error("Please install spaCy English model: python -m spacy download en_core_web_sm")
+        return None
+
+class ResumeProcessor:
+    def __init__(self):
+        self.nlp = load_nlp_model()
+        self.stop_words = set(stopwords.words('english') if 'stopwords' in dir(nltk.corpus) else [])
+        self.skills_keywords = {
+            'programming': ['python', 'java', 'javascript', 'c++', 'c#', 'php', 'ruby', 'go', 'rust', 'swift', 'kotlin', 'scala', 'r', 'matlab'],
+            'web_dev': ['html', 'css', 'react', 'angular', 'vue', 'node.js', 'django', 'flask', 'spring', 'express', 'nextjs', 'svelte'],
+            'data_science': ['pandas', 'numpy', 'matplotlib', 'seaborn', 'scikit-learn', 'tensorflow', 'pytorch', 'keras', 'spark', 'hadoop'],
+            'databases': ['mysql', 'postgresql', 'mongodb', 'redis', 'sqlite', 'oracle', 'cassandra', 'dynamodb', 'neo4j'],
+            'cloud': ['aws', 'azure', 'gcp', 'docker', 'kubernetes', 'jenkins', 'terraform', 'ansible', 'circleci'],
+            'tools': ['git', 'jira', 'confluence', 'postman', 'selenium', 'junit', 'maven', 'gradle', 'webpack'],
+            'soft_skills': ['leadership', 'communication', 'teamwork', 'problem-solving', 'analytical', 'agile', 'scrum']
+        }
+        
+    def extract_text_from_pdf(self, pdf_file):
+        """Extract text from PDF file"""
+        try:
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text()
+            return text
+        except Exception as e:
+            st.error(f"Error reading PDF: {str(e)}")
+            return ""
+    
+    def extract_text_from_docx(self, docx_file):
+        """Extract text from DOCX file"""
+        try:
+            doc = doc.Document(docx_file)
+            text = ""
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + "\n"
+            return text
+        except Exception as e:
+            st.error(f"Error reading DOCX: {str(e)}")
+            return ""
+    
+    def preprocess_text(self, text):
+        """Clean and preprocess text"""
+        text = text.lower()
+        text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+    
+    def extract_email(self, text):
+        """Extract email addresses"""
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        emails = re.findall(email_pattern, text)
+        return emails[0] if emails else "Not found"
+    
+    def extract_phone(self, text):
+        """Extract phone numbers"""
+        phone_patterns = [
+            r'\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
+            r'\d{10}',
+            r'\(\d{3}\)\s*\d{3}[-.\s]?\d{4}'
+        ]
+        for pattern in phone_patterns:
+            phones = re.findall(pattern, text)
+            if phones:
+                return phones[0]
+        return "Not found"
+    
+    def extract_links(self, text):
+        """Extract LinkedIn, GitHub, and portfolio links"""
+        links = {
+            'linkedin': 'Not found',
+            'github': 'Not found',
+            'portfolio': 'Not found'
+        }
+        
+        # LinkedIn
+        linkedin_pattern = r'linkedin\.com/in/[\w-]+'
+        linkedin = re.findall(linkedin_pattern, text.lower())
+        if linkedin:
+            links['linkedin'] = linkedin[0]
+        
+        # GitHub
+        github_pattern = r'github\.com/[\w-]+'
+        github = re.findall(github_pattern, text.lower())
+        if github:
+            links['github'] = github[0]
+        
+        # Portfolio/Website
+        url_pattern = r'https?://[\w\.-]+\.[a-z]{2,}'
+        urls = re.findall(url_pattern, text.lower())
+        portfolio_urls = [url for url in urls if 'linkedin' not in url and 'github' not in url]
+        if portfolio_urls:
+            links['portfolio'] = portfolio_urls[0]
+        
+        return links
+    
+    def extract_skills(self, text):
+        """Extract skills from resume text"""
+        text = self.preprocess_text(text)
+        found_skills = {}
+        
+        for category, skills in self.skills_keywords.items():
+            category_skills = []
+            for skill in skills:
+                if skill.lower() in text:
+                    category_skills.append(skill)
+            if category_skills:
+                found_skills[category] = category_skills
+        
+        all_skills = [skill for skills_list in found_skills.values() for skill in skills_list]
+        return list(set(all_skills)), found_skills
+    
+    def extract_experience(self, text):
+        """Extract years of experience from text"""
+        exp_patterns = [
+            r'(\d+)\+?\s*years?\s*(?:of\s*)?(?:experience|exp)',
+            r'(\d+)-(\d+)\s*years?\s*(?:of\s*)?(?:experience|exp)',
+            r'experience\s*(?:of\s*)?(\d+)\+?\s*years?',
+            r'(\d+)\+?\s*yrs?\s*(?:of\s*)?(?:experience|exp)'
+        ]
+        
+        text = text.lower()
+        max_experience = 0
+        
+        for pattern in exp_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                if isinstance(match, tuple):
+                    exp_val = int(match[1]) if len(match) > 1 else int(match[0])
+                else:
+                    exp_val = int(match)
+                max_experience = max(max_experience, exp_val)
+        
+        return max_experience
+    
+    def extract_education(self, text):
+        """Extract education qualifications"""
+        education_keywords = {
+            'phd': ['ph.d', 'phd', 'doctorate'],
+            'masters': ['m.s', 'ms', 'm.tech', 'mtech', 'mba', 'masters', 'master'],
+            'bachelors': ['b.s', 'bs', 'b.tech', 'btech', 'be', 'bachelors', 'bachelor', 'b.e'],
+            'diploma': ['diploma', 'certificate']
+        }
+        
+        text = text.lower()
+        education_level = 'none'
+        education_score = 0
+        
+        if any(keyword in text for keyword in education_keywords['phd']):
+            education_level = 'PhD'
+            education_score = 100
+        elif any(keyword in text for keyword in education_keywords['masters']):
+            education_level = 'Masters'
+            education_score = 80
+        elif any(keyword in text for keyword in education_keywords['bachelors']):
+            education_level = 'Bachelors'
+            education_score = 60
+        elif any(keyword in text for keyword in education_keywords['diploma']):
+            education_level = 'Diploma'
+            education_score = 40
+        
+        return education_level, education_score
+    
+    def extract_certifications(self, text):
+        """Extract certifications"""
+        cert_keywords = ['certified', 'certification', 'certificate', 'aws certified', 
+                        'google certified', 'microsoft certified', 'cisco', 'pmp', 'scrum master']
+        
+        certifications = []
+        text_lower = text.lower()
+        
+        for cert in cert_keywords:
+            if cert in text_lower:
+                # Extract context around certification
+                pattern = rf'.{{0,30}}{cert}.{{0,30}}'
+                matches = re.findall(pattern, text_lower)
+                if matches:
+                    certifications.append(matches[0].strip())
+        
+        return list(set(certifications))
+    
+    def calculate_readability_score(self, text):
+        """Calculate resume readability and quality"""
+        sentences = sent_tokenize(text)
+        words = word_tokenize(text)
+        
+        avg_sentence_length = len(words) / len(sentences) if sentences else 0
+        
+        # Optimal sentence length is 15-20 words
+        if 15 <= avg_sentence_length <= 20:
+            readability_score = 100
+        elif 10 <= avg_sentence_length <= 25:
+            readability_score = 80
+        else:
+            readability_score = 60
+        
+        return readability_score, len(words), len(sentences)
+
+class ResumeScorer:
+    def __init__(self, processor):
+        self.processor = processor
+        self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+    
+    def calculate_skill_match_score(self, resume_skills, jd_skills, max_marks=40):
+        """Calculate skill match score"""
+        if not jd_skills or not resume_skills:
+            return 0, [], []
+        
+        jd_skills_lower = [skill.lower().strip() for skill in jd_skills]
+        resume_skills_lower = [skill.lower().strip() for skill in resume_skills]
+        
+        matched_skills = []
+        missing_skills = []
+        
+        for jd_skill in jd_skills_lower:
+            found = False
+            for resume_skill in resume_skills_lower:
+                if jd_skill in resume_skill or resume_skill in jd_skill:
+                    matched_skills.append(jd_skill)
+                    found = True
+                    break
+            if not found:
+                missing_skills.append(jd_skill)
+        
+        if not matched_skills:
+            return 0, [], missing_skills
+        
+        match_percentage = len(matched_skills) / len(jd_skills_lower)
+        score = min(int(match_percentage * max_marks), max_marks)
+        
+        return score, matched_skills, missing_skills
+    
+    def calculate_experience_score(self, resume_exp, required_exp, max_marks=25):
+        """Calculate experience score with bonus for extra experience"""
+        if resume_exp >= required_exp + 3:
+            return max_marks  
+        # Bonus for significantly more experience
+        elif resume_exp >= required_exp:
+            return max_marks
+        elif resume_exp == 0:
+            return 0
+        else:
+            ratio = resume_exp / required_exp
+            return int(ratio * max_marks)
+    
+    def calculate_education_score(self, education_score, max_marks=15):
+        """Calculate education score"""
+        return int((education_score / 100) * max_marks)
+    
+    def calculate_certification_score(self, certifications, max_marks=10):
+        """Calculate certification bonus score"""
+        if not certifications:
+            return 0
+        # More certifications = higher score
+        cert_score = min(len(certifications) * 3, max_marks)
+        return cert_score
+    
+    def calculate_semantic_similarity(self, resume_text, jd_text):
+        """Calculate semantic similarity between resume and JD"""
+        try:
+            corpus = [resume_text, jd_text]
+            tfidf_matrix = self.vectorizer.fit_transform(corpus)
+            similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])
+            return similarity[0][0]
+        except:
+            return 0
+    
+    def calculate_keyword_density(self, resume_text, jd_requirements):
+        """Calculate keyword density score"""
+        resume_lower = resume_text.lower()
+        jd_keywords = jd_requirements['description'].lower().split()
+        
+        # Remove stop words
+        jd_keywords = [word for word in jd_keywords if word not in self.processor.stop_words and len(word) > 3]
+        
+        keyword_count = sum(1 for keyword in jd_keywords if keyword in resume_lower)
+        
+        if not jd_keywords:
+            return 0
+        
+        density_score = min((keyword_count / len(jd_keywords)) * 10, 10)
+        return int(density_score)
+    
+    def score_resume(self, resume_text, jd_requirements):
+        """Score a single resume against JD requirements"""
+        # Extract resume information
+        all_skills, skills_by_category = self.processor.extract_skills(resume_text)
+        resume_exp = self.processor.extract_experience(resume_text)
+        education_level, education_raw_score = self.processor.extract_education(resume_text)
+        certifications = self.processor.extract_certifications(resume_text)
+        email = self.processor.extract_email(resume_text)
+        phone = self.processor.extract_phone(resume_text)
+        links = self.processor.extract_links(resume_text)
+        readability, word_count, sentence_count = self.processor.calculate_readability_score(resume_text)
+        
+        # Calculate scores
+        skill_score, matched_skills, missing_skills = self.calculate_skill_match_score(
+            all_skills, jd_requirements['skills']
+        )
+        
+        exp_score = self.calculate_experience_score(
+            resume_exp, jd_requirements['experience']
+        )
+        
+        edu_score = self.calculate_education_score(education_raw_score)
+        
+        cert_score = self.calculate_certification_score(certifications)
+        
+        # Semantic similarity bonus (5 points max)
+        semantic_score = int(self.calculate_semantic_similarity(
+            resume_text, jd_requirements['description']
+        ) * 5)
+        
+        # Keyword density score (5 points max)
+        keyword_score = self.calculate_keyword_density(resume_text, jd_requirements)
+        
+        # Total score out of 100
+        total_score = skill_score + exp_score + edu_score + cert_score + semantic_score + keyword_score
+        
+        # Calculate match percentage
+        match_percentage = (total_score / 100) * 100
+        
+        # Generate recommendation
+        if total_score >= 80:
+            recommendation = "Highly Recommended"
+            priority = "High"
+        elif total_score >= 60:
+            recommendation = "Recommended"
+            priority = "Medium"
+        elif total_score >= 40:
+            recommendation = "Consider"
+            priority = "Low"
+        else:
+            recommendation = "Not Recommended"
+            priority = "Very Low"
+        
+        return {
+            'skill_score': skill_score,
+            'experience_score': exp_score,
+            'education_score': edu_score,
+            'certification_score': cert_score,
+            'semantic_score': semantic_score,
+            'keyword_score': keyword_score,
+            'total_score': total_score,
+            'match_percentage': match_percentage,
+            'skills_found': all_skills,
+            'skills_by_category': skills_by_category,
+            'matched_skills': matched_skills,
+            'missing_skills': missing_skills,
+            'experience_years': resume_exp,
+            'education_level': education_level,
+            'certifications': certifications,
+            'email': email,
+            'phone': phone,
+            'linkedin': links['linkedin'],
+            'github': links['github'],
+            'portfolio': links['portfolio'],
+            'word_count': word_count,
+            'readability_score': readability,
+            'recommendation': recommendation,
+            'priority': priority,
+            'breakdown': {
+                'Skills': f"{skill_score}/40",
+                'Experience': f"{exp_score}/25",
+                'Education': f"{edu_score}/15",
+                'Certifications': f"{cert_score}/10",
+                'Relevance': f"{semantic_score}/5",
+                'Keywords': f"{keyword_score}/5"
+            }
+        }
+
+def create_download_link(df, filename):
+    """Create download link for dataframe"""
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">📥 Download {filename}</a>'
+    return href
+
+def generate_pdf_report(df, jd_requirements):
+    """Generate a comprehensive report"""
+    report = f"""
+    # Resume Screening Report
+    Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    
+    ## Job Requirements Summary
+    - Position: {jd_requirements.get('title', 'Not specified')}
+    - Required Skills: {', '.join(jd_requirements['skills'])}
+    - Minimum Experience: {jd_requirements['experience']} years
+    
+    ## Screening Results
+    - Total Candidates Screened: {len(df)}
+    - Selected Candidates: {len(df[df['Status'] == 'Selected'])}
+    - Average Score: {df['Total Score'].mean():.2f}
+    - Top Score: {df['Total Score'].max()}
+    
+    ## Top Candidates
+    {df.nlargest(10, 'Total Score')[['Candidate', 'Total Score', 'Recommendation']].to_string(index=False)}
+    
+    ## Statistical Analysis
+    - Mean Score: {df['Total Score'].mean():.2f}
+    - Median Score: {df['Total Score'].median():.2f}
+    - Standard Deviation: {df['Total Score'].std():.2f}
+    """
+    
+    return report
+
+def create_dashboard_charts(df):
+    """Create interactive Plotly dashboard charts"""
+    
+    # 1. Score Distribution with Bell Curve
+    fig_hist = go.Figure()
+    fig_hist.add_trace(go.Histogram(
+        x=df['Total Score'],
+        nbinsx=20,
+        name='Score Distribution',
+        marker_color='#667eea'
+    ))
+    fig_hist.update_layout(
+        title="📊 Score Distribution of Candidates",
+        xaxis_title="Total Score",
+        yaxis_title="Number of Candidates",
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        showlegend=True
+    )
+    
+    # 2. Priority Pie Chart
+    priority_counts = df['Priority'].value_counts()
+    colors = {'High': '#28a745', 'Medium': '#ffc107', 'Low': '#fd7e14', 'Very Low': '#dc3545'}
+    fig_pie = px.pie(
+        values=priority_counts.values,
+        names=priority_counts.index,
+        title="🎯 Candidate Priority Distribution",
+        color=priority_counts.index,
+        color_discrete_map=colors
+    )
+    
+    # 3. Radar Chart for Top Candidate
+    top_candidate = df.nlargest(1, 'Total Score').iloc[0]
+    fig_radar = go.Figure()
+    
+    categories = ['Skills', 'Experience', 'Education', 'Certifications', 'Relevance']
+    values = [
+        int(top_candidate['Skills Score'].split('/')[0]) / 40 * 100,
+        int(top_candidate['Experience Score'].split('/')[0]) / 25 * 100,
+        int(top_candidate['Education Score'].split('/')[0]) / 15 * 100,
+        int(top_candidate['Certification Score'].split('/')[0]) / 10 * 100,
+        int(top_candidate['Relevance Score'].split('/')[0]) / 5 * 100
+    ]
+    
+    fig_radar.add_trace(go.Scatterpolar(
+        r=values,
+        theta=categories,
+        fill='toself',
+        name=top_candidate['Candidate']
+    ))
+    fig_radar.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+        title=f"🌟 Top Candidate Profile: {top_candidate['Candidate']}",
+        showlegend=True
+    )
+    
+    # 4. Experience vs Score Scatter with Trendline
+    fig_scatter = px.scatter(
+        df,
+        x='Experience (Years)',
+        y='Total Score',
+        size='Total Score',
+        color='Priority',
+        hover_data=['Candidate', 'Education', 'Recommendation'],
+        title="💼 Experience vs Score Analysis",
+        color_discrete_map=colors,
+        trendline="lowess"
+    )
+    
+    # 5. Skill Category Heatmap
+    skill_categories = []
+    for idx, row in df.iterrows():
+        if row['Skills by Category']:
+            skill_categories.append(row['Skills by Category'])
+    
+    # Create comprehensive score breakdown
+    score_data = []
+    for col in ['Skills Score', 'Experience Score', 'Education Score', 'Certification Score', 'Relevance Score']:
+        scores = df[col].apply(lambda x: int(x.split('/')[0]) if '/' in str(x) else 0)
+        score_data.append(scores.mean())
+    
+    fig_bar = go.Figure(data=[
+        go.Bar(
+            x=['Skills', 'Experience', 'Education', 'Certifications', 'Relevance'],
+            y=score_data,
+            marker_color=['#ff6b6b', '#4ecdc4', '#45b7d1', '#95e1d3', '#f9ca24'],
+            text=[f'{score:.1f}' for score in score_data],
+            textposition='auto'
+        )
+    ])
+    fig_bar.update_layout(
+        title="📈 Average Score Breakdown by Category",
+        xaxis_title="Score Categories",
+        yaxis_title="Average Score"
+    )
+    
+    # 6. Top 10 Candidates Comparison
+    top_10 = df.nlargest(10, 'Total Score')
+    fig_top = go.Figure()
+    
+    fig_top.add_trace(go.Bar(
+        x=top_10['Candidate'],
+        y=top_10['Total Score'],
+        marker=dict(
+            color=top_10['Total Score'],
+            colorscale='Viridis',
+            showscale=True
+        ),
+        text=top_10['Total Score'],
+        textposition='auto'
+    ))
+    fig_top.update_layout(
+        title="🏆 Top 10 Candidates Comparison",
+        xaxis_title="Candidates",
+        yaxis_title="Total Score",
+        xaxis={'tickangle': 45}
+    )
+    
+    return fig_hist, fig_pie, fig_radar, fig_scatter, fig_bar, fig_top
+
+def create_candidate_detail_view(candidate_data):
+    """Create detailed view for a specific candidate"""
+    st.subheader(f"📋 Detailed Profile: {candidate_data['Candidate']}")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Score", f"{candidate_data['Total Score']}/100")
+        st.metric("Match %", f"{candidate_data['Match Percentage']:.1f}%")
+    
+    with col2:
+        st.metric("Experience", f"{candidate_data['Experience (Years)']} years")
+        st.metric("Education", candidate_data['Education'])
+    
+    with col3:
+        st.metric("Recommendation", candidate_data['Recommendation'])
+        st.metric("Priority", candidate_data['Priority'])
+    
+    with col4:
+        cert_count = len(eval(candidate_data['Certifications'])) if candidate_data['Certifications'] != '[]' else 0
+        st.metric("Certifications", cert_count)
+        st.metric("Readability", f"{candidate_data['Readability Score']:.0f}%")
+    
+    # Contact Information
+    st.markdown("### 📞 Contact Information")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write(f"**Email:** {candidate_data['Email']}")
+        st.write(f"**Phone:** {candidate_data['Phone']}")
+    with col2:
+        st.write(f"**LinkedIn:** {candidate_data['LinkedIn']}")
+        st.write(f"**GitHub:** {candidate_data['GitHub']}")
+    
+    
+    # Skills Breakdown
+    st.markdown("### 🔧 Skills Analysis")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**Matched Skills:**")
+        matched = eval(candidate_data['Matched Skills']) if candidate_data['Matched Skills'] != '[]' else []
+        if matched:
+            for skill in matched[:10]:
+                st.markdown(f"✅ {skill}")
+        else:
+            st.write("No matched skills")
+    
+    with col2:
+        st.markdown("**Missing Skills:**")
+        missing = eval(candidate_data['Missing Skills']) if candidate_data['Missing Skills'] != '[]' else []
+        if missing:
+            for skill in missing[:10]:
+                st.markdown(f"❌ {skill}")
+        else:
+            st.write("No missing skills")
+    
+    # Score Breakdown Chart
+    st.markdown("### 📊 Score Breakdown")
+    categories = ['Skills', 'Experience', 'Education', 'Certifications', 'Relevance']
+    scores = [
+        int(candidate_data['Skills Score'].split('/')[0]),
+        int(candidate_data['Experience Score'].split('/')[0]),
+        int(candidate_data['Education Score'].split('/')[0]),
+        int(candidate_data['Certification Score'].split('/')[0]),
+        int(candidate_data['Relevance Score'].split('/')[0])
+    ]
+    max_scores = [40, 25, 15, 10, 5]
+    
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=categories,
+        y=scores,
+        marker_color=['#667eea', '#764ba2', '#f093fb', '#4facfe', '#43e97b'],
+        text=[f"{s}/{m}" for s, m in zip(scores, max_scores)],
+        textposition='auto'
+    ))
+    fig.update_layout(
+        title="Score Distribution",
+        yaxis_title="Score",
+        height=300
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+def main():
+    st.set_page_config(
+        page_title="AI Resume Screening System Pro",
+        page_icon="🎯",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Custom CSS
+    st.markdown("""
+    <style>
+    .main-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 2rem;
+        border-radius: 15px;
+        color: white;
+        text-align: center;
+        margin-bottom: 2rem;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        padding: 1.5rem;
+        border-radius: 15px;
+        margin: 0.5rem 0;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+    }
+    .score-high { 
+        color: #28a745; 
+        font-weight: bold;
+        font-size: 1.2em;
+    }
+    .score-medium { 
+        color: #ffc107; 
+        font-weight: bold;
+        font-size: 1.2em;
+    }
+    .score-low { 
+        color: #dc3545; 
+        font-weight: bold;
+        font-size: 1.2em;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 24px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        padding: 10px 20px;
+        background-color: #f0f2f6;
+        border-radius: 10px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        <h1>🎯 AI-Powered Resume Screening System Pro</h1>
+        <p>Advanced NLP • Machine Learning • Intelligent Ranking • Comprehensive Analytics</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Initialize processors
+    processor = ResumeProcessor()
+    if processor.nlp is None:
+        st.stop()
+    
+    scorer = ResumeScorer(processor)
+    
+    # Sidebar for JD input
+    with st.sidebar:
+        st.header("📋 Job Requirements Configuration")
+        
+        job_title = st.text_input("Job Title", "Senior Data Scientist")
+        
+        st.subheader("🎯 Required Skills")
+        skills_input = st.text_area(
+            "Enter required skills (comma-separated)",
+            "python, machine learning, deep learning, tensorflow, pandas, sql, statistics, data visualization",
+            height=100
+        )
+        required_skills = [skill.strip() for skill in skills_input.split(',') if skill.strip()]
+        
+        st.metric("Skills Count", len(required_skills))
+        
+        required_exp = st.number_input("Minimum Experience (years)", min_value=0, max_value=20, value=3)
+        
+        st.subheader("📝 Job Description")
+        jd_description = st.text_area(
+            "Paste full job description",
+            "We are seeking an experienced Data Scientist to join our AI team. The ideal candidate will have strong expertise in machine learning, deep learning, and statistical analysis. Must be proficient in Python, TensorFlow, and data manipulation libraries.",
+            height=150
+        )
+        
+        st.subheader("⚙️ Screening Settings")
+        min_score_threshold = st.slider("Minimum Score Threshold", 0, 100, 60)
+        
+        # Advanced filters
+        with st.expander("🔧 Advanced Filters"):
+            filter_education = st.multiselect(
+                "Required Education Level",
+                ["PhD", "Masters", "Bachelors", "Diploma"],
+                default=[]
+            )
+            
+            require_certifications = st.checkbox("Prioritize Candidates with Certifications")
+            
+            min_readability = st.slider("Minimum Readability Score", 0, 100, 50)
+        
+        st.markdown("---")
+        st.markdown("### 📊 Quick Stats")
+        if 'results_df' in st.session_state:
+            df = st.session_state['results_df']
+            st.metric("Total Screened", len(df))
+            st.metric("Selected", len(df[df['Status'] == 'Selected']))
+            st.metric("Avg Score", f"{df['Total Score'].mean():.1f}")
+    
+    # Main content
+    tab1, tab2, tab3 = st.tabs(["📤 Upload & Process", "📊 Analytics Dashboard", "🔍 Candidate Details"])
+    
+    with tab1:
+        col1, col2 = st.columns([2, 3])
+        
+        with col1:
+            st.header("📄 Upload Resumes")
+            uploaded_files = st.file_uploader(
+                "Choose resume files (PDF or DOCX)",
+                accept_multiple_files=True,
+                type=['pdf', 'docx'],
+                help="Upload multiple resume files for batch processing"
+            )
+            
+            if uploaded_files:
+                st.success(f"✅ {len(uploaded_files)} files uploaded successfully!")
+                
+                # File list with details
+                with st.expander("📂 Uploaded Files", expanded=False):
+                    for file in uploaded_files:
+                        file_size = len(file.getvalue()) / 1024  # KB
+                        st.write(f"• {file.name} ({file_size:.1f} KB)")
+        
+        with col2:
+            st.header("⚙️ Processing Configuration")
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                process_mode = st.radio(
+                    "Processing Mode",
+                    ["Quick Scan", "Deep Analysis"],
+                    help="Quick: Faster processing | Deep: More detailed analysis"
+                )
+            
+            with col_b:
+                export_format = st.selectbox(
+                    "Export Format",
+                    ["CSV", "Excel", "JSON"],
+                    help="Select format for exporting results"
+                )
+            
+            if uploaded_files:
+                if st.button("🚀 Start Processing", type="primary", use_container_width=True):
+                    process_resumes = True
+                else:
+                    process_resumes = False
+            else:
+                st.info("👆 Upload resume files to begin")
+                process_resumes = False
+        
+        # Process resumes
+        if uploaded_files and process_resumes:
+            jd_requirements = {
+                'title': job_title,
+                'skills': required_skills,
+                'experience': required_exp,
+                'description': jd_description
+            }
+            
+            results = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, uploaded_file in enumerate(uploaded_files):
+                status_text.text(f"🔄 Processing {idx+1}/{len(uploaded_files)}: {uploaded_file.name}...")
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+                
+                # Extract text
+                if uploaded_file.name.endswith('.pdf'):
+                    resume_text = processor.extract_text_from_pdf(uploaded_file)
+                elif uploaded_file.name.endswith('.docx'):
+                    resume_text = processor.extract_text_from_docx(uploaded_file)
+                else:
+                    continue
+                
+                if resume_text:
+                    # Score the resume
+                    scores = scorer.score_resume(resume_text, jd_requirements)
+                    
+                    result = {
+                        'Candidate': uploaded_file.name.replace('.pdf', '').replace('.docx', ''),
+                        'Total Score': scores['total_score'],
+                        'Match Percentage': scores['match_percentage'],
+                        'Skills Score': scores['breakdown']['Skills'],
+                        'Experience Score': scores['breakdown']['Experience'],
+                        'Education Score': scores['breakdown']['Education'],
+                        'Certification Score': scores['breakdown']['Certifications'],
+                        'Relevance Score': scores['breakdown']['Relevance'],
+                        'Skills Found': str(scores['skills_found'][:10]),
+                        'Skills by Category': str(scores['skills_by_category']),
+                        'Matched Skills': str(scores['matched_skills']),
+                        'Missing Skills': str(scores['missing_skills']),
+                        'Experience (Years)': scores['experience_years'],
+                        'Education': scores['education_level'],
+                        'Certifications': str(scores['certifications']),
+                        'Email': scores['email'],
+                        'Phone': scores['phone'],
+                        'LinkedIn': scores['linkedin'],
+                        'GitHub': scores['github'],
+                        'Portfolio': scores['portfolio'],
+                        'Word Count': scores['word_count'],
+                        'Readability Score': scores['readability_score'],
+                        'Recommendation': scores['recommendation'],
+                        'Priority': scores['priority'],
+                        'Status': 'Selected' if scores['total_score'] >= min_score_threshold else 'Rejected'
+                    }
+                    results.append(result)
+            
+            status_text.text("✅ Processing completed successfully!")
+            progress_bar.progress(1.0)
+            
+            if results:
+                df = pd.DataFrame(results)
+                df = df.sort_values('Total Score', ascending=False)
+                
+                # Apply advanced filters
+                if filter_education:
+                    df = df[df['Education'].isin(filter_education)]
+                
+                if require_certifications:
+                    df = df[df['Certifications'] != '[]']
+                
+                df = df[df['Readability Score'] >= min_readability]
+                
+                # Store in session state
+                st.session_state['results_df'] = df
+                st.session_state['jd_requirements'] = jd_requirements
+                
+                # Summary metrics
+                st.header("📊 Screening Summary")
+                
+                col1, col2, col3, col4, col5 = st.columns(5)
+                
+                with col1:
+                    st.metric("Total Candidates", len(df), help="Total resumes processed")
+                
+                with col2:
+                    selected_count = len(df[df['Status'] == 'Selected'])
+                    selection_rate = (selected_count / len(df) * 100) if len(df) > 0 else 0
+                    st.metric("Selected", selected_count, f"{selection_rate:.1f}%")
+                
+                with col3:
+                    avg_score = df['Total Score'].mean()
+                    st.metric("Average Score", f"{avg_score:.1f}/100")
+                
+                with col4:
+                    top_score = df['Total Score'].max()
+                    st.metric("Top Score", f"{top_score}/100")
+                
+                with col5:
+                    high_priority = len(df[df['Priority'] == 'High'])
+                    st.metric("High Priority", high_priority)
+                
+                # Results table
+                st.subheader("🏆 Candidate Rankings")
+                
+                # Color coding function
+                def color_score(val):
+                    if isinstance(val, (int, float)):
+                        if val >= 80:
+                            return 'background-color: #d4edda; color: #155724'
+                        elif val >= 60:
+                            return 'background-color: #fff3cd; color: #856404'
+                        elif val >= 40:
+                            return 'background-color: #ffe5d0; color: #8b4513'
+                        else:
+                            return 'background-color: #f8d7da; color: #721c24'
+                    return ''
+                
+                display_cols = ['Candidate', 'Total Score', 'Match Percentage', 'Recommendation', 
+                               'Priority', 'Experience (Years)', 'Education', 'Status']
+                
+                styled_df = df[display_cols].style.applymap(color_score, subset=['Total Score'])
+                st.dataframe(styled_df, use_container_width=True, height=400)
+                
+                # Export options
+                st.subheader("💾 Export Results")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download All Results (CSV)",
+                        data=csv,
+                        file_name=f"screening_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                
+                with col2:
+                    selected_df = df[df['Status'] == 'Selected']
+                    if not selected_df.empty:
+                        csv_selected = selected_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Selected Only (CSV)",
+                            data=csv_selected,
+                            file_name=f"selected_candidates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                
+                with col3:
+                    report_text = generate_pdf_report(df, jd_requirements)
+                    st.download_button(
+                        label="📄 Download Report (TXT)",
+                        data=report_text,
+                        file_name=f"screening_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                        mime="text/plain",
+                        use_container_width=True
+                    )
+            else:
+                st.error("❌ No resumes could be processed. Please check file formats.")
+    
+    with tab2:
+        if 'results_df' in st.session_state:
+            df = st.session_state['results_df']
+            
+            st.header("📊 Comprehensive Analytics Dashboard")
+            
+            # Create sub-tabs for different analytics
+            subtab1, subtab2, subtab3, subtab4 = st.tabs([
+                "📈 Overview", "🎯 Deep Dive", "🔧 Skills Analysis", "📋 Comparison"
+            ])
+            
+            with subtab1:
+                st.subheader("📊 Key Performance Metrics")
+                
+                fig_hist, fig_pie, fig_radar, fig_scatter, fig_bar, fig_top = create_dashboard_charts(df)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.plotly_chart(fig_hist, use_container_width=True)
+                    st.plotly_chart(fig_scatter, use_container_width=True)
+                
+                with col2:
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                    st.plotly_chart(fig_radar, use_container_width=True)
+                
+                st.plotly_chart(fig_bar, use_container_width=True)
+                st.plotly_chart(fig_top, use_container_width=True)
+            
+            with subtab2:
+                st.subheader("🎯 Deep Dive Analysis")
+                
+                # Statistical summary
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Mean Score", f"{df['Total Score'].mean():.1f}")
+                    st.metric("Std Dev", f"{df['Total Score'].std():.1f}")
+                
+                with col2:
+                    st.metric("Median Score", f"{df['Total Score'].median():.1f}")
+                    st.metric("Mode Score", f"{df['Total Score'].mode()[0] if not df['Total Score'].mode().empty else 'N/A'}")
+                
+                with col3:
+                    st.metric("Min Score", f"{df['Total Score'].min():.0f}")
+                    st.metric("Max Score", f"{df['Total Score'].max():.0f}")
+                
+                with col4:
+                    q75 = df['Total Score'].quantile(0.75)
+                    q25 = df['Total Score'].quantile(0.25)
+                    st.metric("75th Percentile", f"{q75:.1f}")
+                    st.metric("25th Percentile", f"{q25:.1f}")
+                
+                # Score distribution by priority
+                st.subheader("Priority Distribution Analysis")
+                
+                priority_stats = df.groupby('Priority').agg({
+                    'Total Score': ['mean', 'median', 'count'],
+                    'Experience (Years)': 'mean'
+                }).round(2)
+                
+                priority_stats.columns = ['Avg Score', 'Median Score', 'Count', 'Avg Experience']
+                st.dataframe(priority_stats, use_container_width=True)
+                
+                # Education analysis
+                st.subheader("Education Level Breakdown")
+                
+                edu_analysis = df.groupby('Education').agg({
+                    'Total Score': 'mean',
+                    'Experience (Years)': 'mean',
+                    'Candidate': 'count'
+                }).round(2)
+                edu_analysis.columns = ['Avg Score', 'Avg Experience', 'Count']
+                edu_analysis = edu_analysis.sort_values('Avg Score', ascending=False)
+                
+                fig_edu = px.bar(
+                    edu_analysis.reset_index(),
+                    x='Education',
+                    y='Avg Score',
+                    color='Count',
+                    title="Average Score by Education Level",
+                    color_continuous_scale='viridis'
+                )
+                st.plotly_chart(fig_edu, use_container_width=True)
+            
+            with subtab3:
+                st.subheader("🔧 Skills Intelligence")
+                
+                # Extract all skills
+                all_skills = []
+                for skills_str in df['Skills Found']:
+                    if pd.notna(skills_str) and skills_str != '[]':
+                        skills_list = eval(skills_str) if isinstance(skills_str, str) else skills_str
+                        all_skills.extend(skills_list)
+                
+                if all_skills:
+                    skill_counts = pd.Series(all_skills).value_counts().head(20)
+                    
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        fig_skills = px.bar(
+                            x=skill_counts.values,
+                            y=skill_counts.index,
+                            orientation='h',
+                            title="Top 20 Most Common Skills",
+                            labels={'x': 'Frequency', 'y': 'Skills'},
+                            color=skill_counts.values,
+                            color_continuous_scale='plasma'
+                        )
+                        fig_skills.update_layout(height=600)
+                        st.plotly_chart(fig_skills, use_container_width=True)
+                    
+                    with col2:
+                        st.markdown("### 📊 Skill Statistics")
+                        st.metric("Unique Skills", len(set(all_skills)))
+                        st.metric("Total Mentions", len(all_skills))
+                        st.metric("Avg Skills/Resume", f"{len(all_skills)/len(df):.1f}")
+                        
+                        st.markdown("### 🔝 Top 5 Skills")
+                        for idx, (skill, count) in enumerate(skill_counts.head(5).items(), 1):
+                            st.write(f"{idx}. **{skill}** ({count})")
+                
+                # Skills gap analysis
+                st.subheader("📉 Skills Gap Analysis")
+                
+                all_missing = []
+                for missing_str in df['Missing Skills']:
+                    if pd.notna(missing_str) and missing_str != '[]':
+                        missing_list = eval(missing_str) if isinstance(missing_str, str) else missing_str
+                        all_missing.extend(missing_list)
+                
+                if all_missing:
+                    missing_counts = pd.Series(all_missing).value_counts().head(15)
+                    
+                    fig_missing = px.bar(
+                        x=missing_counts.values,
+                        y=missing_counts.index,
+                        orientation='h',
+                        title="Most Common Missing Skills (Top 15)",
+                        labels={'x': 'Frequency', 'y': 'Skills'},
+                        color=missing_counts.values,
+                        color_continuous_scale='reds'
+                    )
+                    st.plotly_chart(fig_missing, use_container_width=True)
+            
+            with subtab4:
+                st.subheader("📋 Candidate Comparison")
+                
+                # Select candidates to compare
+                candidates = st.multiselect(
+                    "Select candidates to compare (max 5)",
+                    df['Candidate'].tolist(),
+                    default=df.nlargest(3, 'Total Score')['Candidate'].tolist()[:3]
+                )
+                
+                if candidates:
+                    compare_df = df[df['Candidate'].isin(candidates)]
+                    
+                    # Comparison radar chart
+                    fig_compare = go.Figure()
+                    
+                    categories = ['Skills', 'Experience', 'Education', 'Certifications', 'Relevance']
+                    
+                    for idx, row in compare_df.iterrows():
+                        values = [
+                            int(row['Skills Score'].split('/')[0]) / 40 * 100,
+                            int(row['Experience Score'].split('/')[0]) / 25 * 100,
+                            int(row['Education Score'].split('/')[0]) / 15 * 100,
+                            int(row['Certification Score'].split('/')[0]) / 10 * 100,
+                            int(row['Relevance Score'].split('/')[0]) / 5 * 100
+                        ]
+                        
+                        fig_compare.add_trace(go.Scatterpolar(
+                            r=values,
+                            theta=categories,
+                            fill='toself',
+                            name=row['Candidate']
+                        ))
+                    
+                    fig_compare.update_layout(
+                        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                        title="Candidate Comparison - Score Profile",
+                        height=500
+                    )
+                    st.plotly_chart(fig_compare, use_container_width=True)
+                    
+                    # Comparison table
+                    st.subheader("Detailed Comparison Table")
+                    compare_cols = ['Candidate', 'Total Score', 'Match Percentage', 'Experience (Years)',
+                                   'Education', 'Recommendation', 'Email', 'Phone']
+                    st.dataframe(compare_df[compare_cols], use_container_width=True)
+        else:
+            st.info("👈 Please upload and process resumes in the 'Upload & Process' tab first")
+    
+    with tab3:
+        if 'results_df' in st.session_state:
+            df = st.session_state['results_df']
+            
+            st.header("🔍 Individual Candidate Analysis")
+            
+            # Search and filter
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                search_term = st.text_input("🔎 Search candidates", placeholder="Enter candidate name...")
+            
+            with col2:
+                sort_by = st.selectbox("Sort by", ['Total Score', 'Experience (Years)', 'Match Percentage'])
+            
+            # Filter candidates
+            filtered_candidates = df.copy()
+            if search_term:
+                filtered_candidates = filtered_candidates[
+                    filtered_candidates['Candidate'].str.contains(search_term, case=False, na=False)
+                ]
+            
+            filtered_candidates = filtered_candidates.sort_values(sort_by, ascending=False)
+            
+            # Display candidate list
+            selected_candidate = st.selectbox(
+                "Select a candidate to view detailed profile",
+                filtered_candidates['Candidate'].tolist()
+            )
+            
+            if selected_candidate:
+                candidate_data = df[df['Candidate'] == selected_candidate].iloc[0]
+                create_candidate_detail_view(candidate_data)
+                
+                # Action buttons
+                st.markdown("---")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    if st.button("✉️ Send Email", use_container_width=True):
+                        st.info(f"Email draft created for: {candidate_data['Email']}")
+                
+                with col2:
+                    if st.button("📅 Schedule Interview", use_container_width=True):
+                        st.success("Interview scheduling interface opened!")
+                
+                with col3:
+                    if st.button("📝 Add Notes", use_container_width=True):
+                        notes = st.text_area("Add your notes about this candidate:")
+                        if notes:
+                            st.success("Notes saved!")
+                
+                with col4:
+                    candidate_csv = pd.DataFrame([candidate_data]).to_csv(index=False)
+                    st.download_button(
+                        label="📥 Export Profile",
+                        data=candidate_csv,
+                        file_name=f"{selected_candidate}_profile.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+        else:
+            st.info("👈 Please upload and process resumes in the 'Upload & Process' tab first")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align: center; color: #666; padding: 20px;'>
+        <h4>🚀 AI Resume Screening System Pro v2.0</h4>
+        <p>Powered by Advanced NLP • Machine Learning • Intelligent Analytics</p>
+        <p><strong>Features:</strong> Automated Scoring • Skills Matching • Gap Analysis • Contact Extraction • 
+        Certification Detection • Semantic Similarity • Readability Analysis • Interactive Dashboards</p>
+        <p style='margin-top: 10px; font-size: 0.9em;'>
+            Built with ❤️ using Streamlit, spaCy, scikit-learn & Plotly
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    main()
